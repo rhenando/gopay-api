@@ -4,13 +4,7 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const admin = require("firebase-admin");
-
-// ── Load GCP Service Account from ENV ─────────────────────────
-if (!process.env.GCP_SERVICE_ACCOUNT_JSON) {
-  console.error("❌ GCP_SERVICE_ACCOUNT_JSON is missing");
-  process.exit(1);
-}
-const serviceAccount = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON);
+const serviceAccount = require("./serviceAccountKey.json");
 
 const app = express();
 
@@ -46,14 +40,43 @@ function buildBillItems(items) {
       quantity: item.quantity,
       unitPrice: unit,
       discount: 0,
+      // GoPay expects VAT as one of: "EXE", "0.0", "0.05", "0.15"
       vat: "0.15",
     };
   });
 }
 
+// ── Helper: Fetch GoPay payment info (for QR) ───────────────
+async function fetchPaymentInfo(billNumber) {
+  try {
+    console.log(`🔍 Fetching Payment Info for Bill Number: ${billNumber}`);
+    const headers = {
+      "Content-Type": "application/json",
+      username: API_USERNAME,
+      password: API_PASSWORD,
+    };
+    const response = await axios.get(
+      `${API_BASE_URL}/bill/info?billNumber=${billNumber}`,
+      { headers }
+    );
+    console.log(
+      "✅ Full Payment Info Response:",
+      JSON.stringify(response.data, null, 2)
+    );
+    return response.data;
+  } catch (error) {
+    console.error(
+      "🔥 Error fetching payment info:",
+      error.response?.data || error.message
+    );
+    return null;
+  }
+}
+
 // ── Create Invoice Endpoint ──────────────────────────────────
 app.post("/api/create-invoice", async (req, res) => {
   try {
+    // Destructure front-end payload
     const {
       firstName,
       lastName,
@@ -64,16 +87,18 @@ app.post("/api/create-invoice", async (req, res) => {
       expireDate,
       serviceName,
       items,
-      amount,
-      shippingCost,
+      amount, // grand total (items + shipping + VAT)
+      shippingCost, // separately passed from client
     } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Empty cart: no items to bill." });
     }
 
+    // Build the line items
     const billItemList = buildBillItems(items);
 
+    // Add shipping as its own line item (with VAT)
     if (shippingCost && shippingCost > 0) {
       billItemList.push({
         reference: "shipping",
@@ -85,6 +110,7 @@ app.post("/api/create-invoice", async (req, res) => {
       });
     }
 
+    // Compose the GoPay invoice request
     const invoiceRequest = {
       billNumber: billNumber || Date.now().toString(),
       entityActivityId: ENTITY_ACTIVITY_ID,
@@ -104,12 +130,15 @@ app.post("/api/create-invoice", async (req, res) => {
       showOnlinePayNowButton: true,
     };
 
+    console.log("➡️  Sending invoice to GoPay:", invoiceRequest);
+
     const headers = {
       "Content-Type": "application/json",
       username: API_USERNAME,
       password: API_PASSWORD,
     };
 
+    // 1) Upload invoice
     const gp = await axios.post(
       `${API_BASE_URL}/simple/upload`,
       invoiceRequest,
@@ -123,8 +152,10 @@ app.post("/api/create-invoice", async (req, res) => {
         .json({ error: "No billNumber returned by GoPay." });
     }
 
+    // 2) Wait briefly for QR generation
     await new Promise((r) => setTimeout(r, 3000));
 
+    // 3) Fetch the QR/info endpoint
     const info = await axios.get(
       `${API_BASE_URL}/bill/info?billNumber=${billNo}`,
       { headers }
@@ -134,6 +165,7 @@ app.post("/api/create-invoice", async (req, res) => {
       (qrText.match(/https:\/\/.*verify\/bill\?billNumber=\w+/) || [])[0] ||
       null;
 
+    // 4) Return the redirect URL to your front-end
     return res.json({
       success: true,
       billNumber: billNo,
@@ -153,11 +185,18 @@ app.post("/api/create-invoice", async (req, res) => {
 // ── Payment Notification Webhook ────────────────────────────
 app.post("/api/payment-notification", async (req, res) => {
   try {
+    console.log(
+      "🔔 Incoming Payment Notification:",
+      JSON.stringify(req.body, null, 2)
+    );
+
     const { billNumber, paymentStatus, paymentAmount, paymentDate } = req.body;
     if (!billNumber || !paymentStatus) {
+      console.error("❌ Missing required fields:", req.body);
       return res.status(400).json({ error: "Missing required fields" });
     }
 
+    // Store in Firestore
     const paymentRef = db.collection("payments").doc(billNumber);
     await paymentRef.set(
       {
@@ -169,22 +208,30 @@ app.post("/api/payment-notification", async (req, res) => {
       { merge: true }
     );
 
-    return res.json({ status: 200, message: "Operation Done Successfully" });
+    console.log(`✅ Payment ${paymentStatus} recorded for Bill: ${billNumber}`);
+    res.json({ status: 200, message: "Operation Done Successfully" });
   } catch (error) {
     console.error("🔥 Error handling payment notification:", error);
-    return res.status(500).json({ error: "Internal Server Error" });
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
 // ── Settlement Notification Webhook ─────────────────────────
 app.post("/api/settlement-notification", async (req, res) => {
   try {
+    console.log(
+      "📩 Incoming Settlement Notification:",
+      JSON.stringify(req.body, null, 2)
+    );
+
     const { billNumber, settlementStatus, paymentAmount, paymentDate, bankId } =
       req.body;
     if (!billNumber || !settlementStatus) {
+      console.error("❌ Missing required fields in settlement:", req.body);
       return res.status(400).json({ error: "Missing required fields" });
     }
 
+    // Store Settlement
     const settlementRef = db.collection("settlements").doc(billNumber);
     await settlementRef.set(
       {
@@ -197,10 +244,11 @@ app.post("/api/settlement-notification", async (req, res) => {
       { merge: true }
     );
 
-    return res.json({ status: 200, message: "Operation Done Successfully" });
+    console.log(`✅ Settlement recorded for Bill: ${billNumber}`);
+    res.json({ status: 200, message: "Operation Done Successfully" });
   } catch (error) {
     console.error("🔥 Error handling settlement notification:", error);
-    return res.status(500).json({ error: "Internal Server Error" });
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
