@@ -1,4 +1,3 @@
-// server.js
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
@@ -123,6 +122,7 @@ app.post("/api/create-invoice", async (req, res) => {
         .json({ error: "No billNumber returned by GoPay." });
     }
 
+    // Wait briefly for GoPay to process
     await new Promise((r) => setTimeout(r, 3000));
 
     const info = await axios.get(

@@ -1,16 +1,25 @@
-// server.js
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
-// ── Load GCP Service Account from ENV ─────────────────────────
-if (!process.env.GCP_SERVICE_ACCOUNT_JSON) {
-  console.error("❌ GCP_SERVICE_ACCOUNT_JSON is missing");
-  process.exit(1);
+// ── Load GCP Service Account ─────────────────────────────────
+let serviceAccount;
+if (process.env.GCP_SERVICE_ACCOUNT_JSON) {
+  // In production, pull from ENV
+  serviceAccount = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON);
+} else {
+  // In local dev, load from file
+  try {
+    serviceAccount = require("./serviceAccountKey.json");
+  } catch (err) {
+    console.error(
+      "❌ serviceAccountKey.json not found and GCP_SERVICE_ACCOUNT_JSON not set"
+    );
+    process.exit(1);
+  }
 }
-const serviceAccount = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON);
 
 const app = express();
 
@@ -20,35 +29,37 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
 // ── Healthcheck ─────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.send("🚀 GoPay API is Running!");
-});
+app.get("/", (req, res) => res.send("🚀 GoPay API is Running!"));
 
 // ── Firestore Init ──────────────────────────────────────────
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// ── GoPay Credentials ───────────────────────────────────────
-const API_BASE_URL = process.env.API_BASE_URL;
-const API_USERNAME = process.env.GOPAY_USERNAME;
-const API_PASSWORD = process.env.GOPAY_PASSWORD;
-const ENTITY_ACTIVITY_ID = process.env.ENTITY_ACTIVITY_ID;
+// ── Determine Environment & GoPay Credentials ────────────────
+const isProduction = process.env.NODE_ENV === "production";
+const API_BASE_URL = isProduction
+  ? process.env.API_BASE_URL
+  : process.env.LOCAL_API_BASE_URL || process.env.API_BASE_URL;
+const API_USERNAME = isProduction
+  ? process.env.GOPAY_USERNAME
+  : process.env.LOCAL_GOPAY_USERNAME || process.env.GOPAY_USERNAME;
+const API_PASSWORD = isProduction
+  ? process.env.GOPAY_PASSWORD
+  : process.env.LOCAL_GOPAY_PASSWORD || process.env.GOPAY_PASSWORD;
+const ENTITY_ACTIVITY_ID = isProduction
+  ? process.env.ENTITY_ACTIVITY_ID
+  : process.env.LOCAL_ENTITY_ACTIVITY_ID || process.env.ENTITY_ACTIVITY_ID;
 
-// ── Helper: Build GoPay line items from your cart ───────────
+// ── Helper: Build GoPay line items ───────────────────────────
 function buildBillItems(items) {
-  return items.map((item) => {
-    const unit = Number(item.subtotal / item.quantity).toFixed(2);
-    return {
-      reference: item.id,
-      name: item.productName,
-      quantity: item.quantity,
-      unitPrice: unit,
-      discount: 0,
-      vat: "0.15",
-    };
-  });
+  return items.map((item) => ({
+    reference: item.id,
+    name: item.productName,
+    quantity: item.quantity,
+    unitPrice: Number(item.subtotal / item.quantity).toFixed(2),
+    discount: 0,
+    vat: "0.15",
+  }));
 }
 
 // ── Create Invoice Endpoint ──────────────────────────────────
@@ -67,14 +78,10 @@ app.post("/api/create-invoice", async (req, res) => {
       amount,
       shippingCost,
     } = req.body;
-
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: "Empty cart: no items to bill." });
-    }
-
+    if (!Array.isArray(items) || !items.length)
+      return res.status(400).json({ error: "Empty cart" });
     const billItemList = buildBillItems(items);
-
-    if (shippingCost && shippingCost > 0) {
+    if (shippingCost > 0)
       billItemList.push({
         reference: "shipping",
         name: "Shipping",
@@ -83,13 +90,11 @@ app.post("/api/create-invoice", async (req, res) => {
         discount: 0,
         vat: "0.15",
       });
-    }
-
     const invoiceRequest = {
       billNumber: billNumber || Date.now().toString(),
       entityActivityId: ENTITY_ACTIVITY_ID,
       customerFullName: `${firstName} ${lastName}`.trim() || "Unknown Buyer",
-      customerEmailAddress: email || "no-reply@yourdomain.com",
+      customerEmailAddress: email || "no-reply@domain.com",
       customerMobileNumber: phone || "0000000000",
       issueDate: issueDate || new Date().toISOString().split("T")[0],
       expireDate:
@@ -103,28 +108,20 @@ app.post("/api/create-invoice", async (req, res) => {
       isPublicView: true,
       showOnlinePayNowButton: true,
     };
-
     const headers = {
       "Content-Type": "application/json",
       username: API_USERNAME,
       password: API_PASSWORD,
     };
-
     const gp = await axios.post(
       `${API_BASE_URL}/simple/upload`,
       invoiceRequest,
       { headers }
     );
-
     const billNo = gp.data?.data?.billNumber;
-    if (!billNo) {
-      return res
-        .status(500)
-        .json({ error: "No billNumber returned by GoPay." });
-    }
-
+    if (!billNo)
+      return res.status(500).json({ error: "No billNumber returned" });
     await new Promise((r) => setTimeout(r, 3000));
-
     const info = await axios.get(
       `${API_BASE_URL}/bill/info?billNumber=${billNo}`,
       { headers }
@@ -133,20 +130,15 @@ app.post("/api/create-invoice", async (req, res) => {
     const redirectUrl =
       (qrText.match(/https:\/\/.*verify\/bill\?billNumber=\w+/) || [])[0] ||
       null;
-
-    return res.json({
-      success: true,
-      billNumber: billNo,
-      redirectUrl,
-    });
+    res.json({ success: true, billNumber: billNo, redirectUrl });
   } catch (err) {
     console.error(
       "🚨 create-invoice error:",
       err.response?.data || err.message
     );
-    return res.status(err.response?.status || 500).json({
-      error: err.response?.data || err.message,
-    });
+    res
+      .status(err.response?.status || 500)
+      .json({ error: err.response?.data || err.message });
   }
 });
 
@@ -154,25 +146,24 @@ app.post("/api/create-invoice", async (req, res) => {
 app.post("/api/payment-notification", async (req, res) => {
   try {
     const { billNumber, paymentStatus, paymentAmount, paymentDate } = req.body;
-    if (!billNumber || !paymentStatus) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    const paymentRef = db.collection("payments").doc(billNumber);
-    await paymentRef.set(
-      {
-        paymentStatus,
-        paymentAmount: paymentAmount || 0,
-        paymentDate: paymentDate || new Date().toISOString(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    return res.json({ status: 200, message: "Operation Done Successfully" });
-  } catch (error) {
-    console.error("🔥 Error handling payment notification:", error);
-    return res.status(500).json({ error: "Internal Server Error" });
+    if (!billNumber || !paymentStatus)
+      return res.status(400).json({ error: "Missing fields" });
+    await db
+      .collection("payments")
+      .doc(billNumber)
+      .set(
+        {
+          paymentStatus,
+          paymentAmount: paymentAmount || 0,
+          paymentDate: paymentDate || new Date().toISOString(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    res.json({ status: 200, message: "Operation Done" });
+  } catch (e) {
+    console.error("🔥 payment-notification error:", e);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
@@ -181,26 +172,25 @@ app.post("/api/settlement-notification", async (req, res) => {
   try {
     const { billNumber, settlementStatus, paymentAmount, paymentDate, bankId } =
       req.body;
-    if (!billNumber || !settlementStatus) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    const settlementRef = db.collection("settlements").doc(billNumber);
-    await settlementRef.set(
-      {
-        settlementStatus,
-        paymentAmount: paymentAmount || 0,
-        paymentDate: paymentDate || new Date().toISOString(),
-        bankId: bankId || "Unknown",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    return res.json({ status: 200, message: "Operation Done Successfully" });
-  } catch (error) {
-    console.error("🔥 Error handling settlement notification:", error);
-    return res.status(500).json({ error: "Internal Server Error" });
+    if (!billNumber || !settlementStatus)
+      return res.status(400).json({ error: "Missing fields" });
+    await db
+      .collection("settlements")
+      .doc(billNumber)
+      .set(
+        {
+          settlementStatus,
+          paymentAmount: paymentAmount || 0,
+          paymentDate: paymentDate || new Date().toISOString(),
+          bankId: bankId || "Unknown",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    res.json({ status: 200, message: "Operation Done" });
+  } catch (e) {
+    console.error("🔥 settlement-notification error:", e);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
